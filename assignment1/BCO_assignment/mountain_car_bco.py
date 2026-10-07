@@ -1,0 +1,211 @@
+import gymnasium as gym
+import argparse
+import pygame
+from teleop import collect_demos
+import torch
+from torch.optim import Adam
+import torch.nn as nn
+import numpy as np
+import torch.nn.functional as F
+
+
+device = torch.device('cpu')
+
+
+# This will be useful for implementing BCO
+def collect_random_interaction_data(num_iters):
+    states = []
+    next_states = []
+    actions = []
+
+    env = gym.make('MountainCar-v0')
+
+    for i in range(num_iters):
+        obs, _ = env.reset()    
+        done = False
+        while not done:
+            a = env.action_space.sample()
+            next_obs, reward, terminated, truncated, info = env.step(a)
+            done = terminated or truncated
+            states.append(obs)
+            next_states.append(next_obs)
+            actions.append(a)
+            obs = next_obs
+    
+    env.close()
+
+    return np.array(states), np.array(next_states), np.array(actions)
+
+
+def collect_human_demos(num_demos):
+    mapping = {(pygame.K_LEFT,): 0, (pygame.K_RIGHT,): 2}
+    env = gym.make("MountainCar-v0",render_mode='rgb_array') 
+    demos = collect_demos(env, keys_to_action=mapping, num_demos=num_demos, noop=1)
+    return demos
+
+
+def torchify_demos(sas_pairs):
+    states = []
+    actions = []
+    next_states = []
+    for s,a, s2 in sas_pairs:
+        states.append(s)
+        actions.append(a)
+        next_states.append(s2)
+
+    states = np.array(states)
+    actions = np.array(actions)
+    next_states = np.array(next_states)
+
+    obs_torch = torch.from_numpy(np.array(states)).float().to(device)
+    obs2_torch = torch.from_numpy(np.array(next_states)).float().to(device)
+    acs_torch = torch.from_numpy(np.array(actions)).long().to(device)
+
+    return obs_torch, acs_torch, obs2_torch
+
+
+def train_policy(obs, acs, nn_policy, num_train_iters):
+    pi_optimizer = Adam(nn_policy.parameters(), lr=0.1)
+    #action space is discrete so our policy just needs to classify which action to take
+    #we typically train classifiers using a cross entropy loss
+    loss_criterion = nn.CrossEntropyLoss()
+    
+    # run BC using all the demos in one giant batch
+    for i in range(num_train_iters):
+        #zero out automatic differentiation from last time
+        pi_optimizer.zero_grad()
+        #run each state in batch through policy to get predicted logits for classifying action
+        pred_action_logits = nn_policy(obs)
+        #now compute loss by comparing what the policy thinks it should do with what the demonstrator didd
+        loss = loss_criterion(pred_action_logits, acs) 
+        # print("iteration", i, "bc loss", loss)
+        #back propagate the error through the network to figure out how update it to prefer demonstrator actions
+        loss.backward()
+        #perform update on policy parameters
+        pi_optimizer.step()
+
+
+
+class PolicyNetwork(nn.Module):
+    '''
+        Simple neural network with two layers that maps a 2-d state to a prediction
+        over which of the three discrete actions should be taken.
+        The three outputs corresponding to the logits for a 3-way classification problem.
+
+    '''
+    def __init__(self):
+        super().__init__()
+
+        #This layer has 2 inputs corresponding to car position and velocity
+        self.fc1 = nn.Linear(2, 8)  
+        #This layer has three outputs corresponding to each of the three discrete actions
+        self.fc2 = nn.Linear(8, 3)  
+
+    def forward(self, x):
+        #this method performs a forward pass through the network, applying a non-linearity (ReLU) on the 
+        #outputs of the first layer
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+class inverse(nn.Module):  
+    # inverse dynamics model
+    def __init__(self,mid) -> None:
+        super().__init__()
+        self.fc1=nn.Linear(4,mid)
+        self.fc2=nn.Linear(mid,3)
+
+    def forward(self,x):
+
+        x= F.relu(self.fc1(x))
+        x= self.fc2(x)
+        return x
+
+
+
+def inverse_dynamics(obs,next_obs, ites, size):
+    model=inverse(size)
+    state,next_state,action=collect_random_interaction_data(10)
+    input= np.concatenate((state,next_state),axis=1)
+
+    input=torch.from_numpy(input).float()
+    action=torch.from_numpy(action).long()
+
+    opt=Adam(model.parameters(),lr=0.01)
+    loss_crt=nn.CrossEntropyLoss()
+
+    for i in range(ites):
+        opt.zero_grad()
+        predict=model(input)
+
+        loss=loss_crt(predict,action)
+
+        # print(f"inv ite:{i} loss:{loss}")
+
+        loss.backward()
+
+        opt.step()
+
+    data=torch.cat((obs,next_obs),dim=1)
+    model.eval()
+    with torch.no_grad():
+        return torch.argmax(model(data),dim=1)
+
+
+
+#evaluate learned policy
+def evaluate_policy(pi, num_evals, human_render=True):
+    if human_render:
+        env = gym.make("MountainCar-v0",render_mode='human') 
+    else:
+        env = gym.make("MountainCar-v0") 
+
+    policy_returns = []
+    for i in range(num_evals):
+        done = False
+        total_reward = 0
+        obs, _ = env.reset()
+        while not done:
+            #take the action that the network assigns the highest logit value to
+            #Note that first we convert from numpy to tensor and then we get the value of the 
+            #argmax using .item() and feed that into the environment
+            action = torch.argmax(pi(torch.from_numpy(obs).unsqueeze(0))).item()
+            # print(action)
+            obs, rew, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            total_reward += rew
+        print("reward for evaluation", i, total_reward)
+        policy_returns.append(total_reward)
+
+    print("average policy return", np.mean(policy_returns))
+    print("min policy return", np.min(policy_returns))
+    print("max policy return", np.max(policy_returns))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=None)
+    parser.add_argument('--num_demos', default = 2, type=int, help="number of human demonstrations to collect")
+    parser.add_argument('--num_bc_iters', default = 100, type=int, help="number of iterations to run BC")
+    parser.add_argument('--num_inv_dyn_iters', default = 2000, type=int, help="number of iterations to train inverse dynamics model")
+    parser.add_argument('--num_evals', default=6, type=int, help="number of times to run policy after training for evaluation")
+    parser.add_argument('--num_inv_size', default=8,type=int,help="the size of neural network of inv model")
+    args = parser.parse_args()
+
+    #collect human demos
+    demos = collect_human_demos(args.num_demos)
+
+    #process demos
+    obs, ground_truth_acts, next_obs = torchify_demos(demos)
+    
+    print(f"model size:{args.num_inv_size}   train ite:{args.num_inv_dyn_iters}")
+    # TODO: ADD CODE TO TRAIN INVERSE DYNAMICS MODEL AND ESTIMATE ACTIONS
+    estimated_acts = inverse_dynamics(obs, next_obs, args.num_inv_dyn_iters, args.num_inv_size)
+    accuracy = (estimated_acts == ground_truth_acts).float().mean().item()
+    print(f"Inverse model accuracy on demonstrations: {accuracy:.2%}")
+    #train policy WITHOUT ground truth actions
+    pi = PolicyNetwork()
+    train_policy(obs, estimated_acts, pi, args.num_bc_iters)
+    
+
+    #evaluate learned policy
+    evaluate_policy(pi, args.num_evals)
