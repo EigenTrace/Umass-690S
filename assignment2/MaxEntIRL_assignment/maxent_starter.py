@@ -112,6 +112,10 @@ def calcMaxEntPolicy(trans_mat, horizon, r_weights, state_features, term_index):
   n_states = np.shape(trans_mat)[0]
   n_actions = np.shape(trans_mat)[1]
   policy = np.zeros((n_states,n_actions))  
+  z= np.zeros((n_states))
+  z_a=np.zeros((n_states,n_actions))
+  z[term_index]=1
+  for i range()
   return policy
 
 
